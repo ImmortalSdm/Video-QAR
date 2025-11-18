@@ -49,9 +49,9 @@ def pixel_reasoner_score(solution_str, ground_truth):
         ground_truth = normalize_answer(ground_truth)
     else:
         ground_truth = f"\\boxed{{{ground_truth}}}"
-    verify_result = verify(parse(solution_str), parse(ground_truth))
+    verify_result = verify(parse(solution_str, parsing_timeout=None), parse(ground_truth, parsing_timeout=None), timeout_seconds=None)
     if not verify_result:
-        verify_result = verify(parse(solution_str.lower()), parse(ground_truth.lower()))
+        verify_result = verify(parse(solution_str.lower(), parsing_timeout=None), parse(ground_truth.lower(), parsing_timeout=None), timeout_seconds=None)
     if verify_result:
         return 1.0
     else:
@@ -69,24 +69,21 @@ class PixelReasonerRewardManager:
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.compute_score = pixel_reasoner_score
         self.reward_fn_key = reward_fn_key
-        self.step = None
         self.add_curiousity_penalty = True
         self.add_action_redundancy_penalty = True
         self.group_tool_call_rate_lower_bound = 0.3 # H in the paper
         self.action_redundancy_limit = 1 # n_{vo} in the paper, add penalty if the number of redundant actions is larger than this limit
         self.alpha = 0.5
         self.beta = 0.05
-        if "record_dir" in kwargs:
-            self.record_dir = Path(kwargs['record_dir'])
-            self.record_dir.mkdir(parents=True, exist_ok=True)
-        
+
     def get_group_info(self, data: DataProto):
         group_info = {}
         for i in range(len(data)):
             data_item = data[i]  # DataProtoItem
-            num_turn = data_item.non_tensor_batch["turns_stats"]
-            num_valid_action = data_item.non_tensor_batch["valid_action_stats"]
-            if "turns_stats" in data_item.non_tensor_batch:
+            tool_interact_info = data_item.non_tensor_batch.get('tool_interact_info', None)
+            num_turn = len(tool_interact_info) if tool_interact_info is not None else 0
+            num_valid_action = sum([1 for t in tool_interact_info if t.get('valid_action', False)]) if tool_interact_info is not None else 0
+            if "tool_interact_info" in data_item.non_tensor_batch:
                 uid = data_item.non_tensor_batch.get('uid', i)
                 if uid not in group_info:
                     group_info[uid] = {}
@@ -104,9 +101,10 @@ class PixelReasonerRewardManager:
         return group_info    
     
     def add_additional_penalties(self, response: str, data_i, scores_i: dict, group_info:dict):
-        if "turns_stats" in data_i.non_tensor_batch:
-            num_turn = data_i.non_tensor_batch["turns_stats"]
-            num_valid_action = data_i.non_tensor_batch["valid_action_stats"]
+        if "tool_interact_info" in data_i.non_tensor_batch:
+            tool_interact_info = data_i.non_tensor_batch.get('tool_interact_info', None)
+            num_turn = len(tool_interact_info) if tool_interact_info is not None else 0
+            num_valid_action = sum([1 for t in tool_interact_info if t.get('valid_action', False)]) if tool_interact_info is not None else 0
             if self.add_curiousity_penalty:
                 penalty = (num_valid_action != 0) * max(0, self.group_tool_call_rate_lower_bound - group_info['group_tool_call_rate'])
                 penalty *= self.alpha
@@ -122,46 +120,19 @@ class PixelReasonerRewardManager:
     
     def __call__(self, data: DataProto, return_dict=False):
         """We will expand this function gradually based on the available datasets"""
-        save_record = data.meta_info.get('save_record', True)
-
-        if not hasattr(self, 'record_dir'):
-            if hasattr(self, 'run_id'):
-                self.record_dir = Path(__file__).parent.parent.parent.parent / "verl_step_records" / self.run_id
-                self.record_dir.mkdir(parents=True, exist_ok=True)
-            else:
-                self.record_dir = Path(__file__).parent.parent.parent.parent / "verl_step_records" / f"torl-{time.strftime('%Y-%m-%d-%H-%M-%S')}"
-                self.record_dir.mkdir(parents=True, exist_ok=True)
-        
-        # check the last step index
-        if self.step is None:
-            last_step_idx = 0
-            for file in os.listdir(self.record_dir):
-                if self.num_examine == 1:
-                    if re.search(r"step-val-\d+\.json", file):
-                        step_idx = int(file[:-len(".json")].split("-")[-1])
-                        if step_idx > last_step_idx:
-                            last_step_idx = step_idx
-                else:
-                    if re.search(r"step-\d+\.json", file):
-                        step_idx = int(file[:-len(".json")].split("-")[-1])
-                        if step_idx > last_step_idx:
-                            last_step_idx = step_idx
-            self.step = last_step_idx + 1
-        if data.meta_info.get('global_step', None) is not None:
-            self.step = data.meta_info['global_step']
-
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
-        if 'rm_scores' in data.batch.keys():
+        if "rm_scores" in data.batch.keys():
             if return_dict:
-                return {"reward_tensor": data.batch['rm_scores']}
+                reward_extra_keys = data.meta_info.get("reward_extra_keys", [])
+                reward_extra_info = {key: data.non_tensor_batch[key] for key in reward_extra_keys}
+                return {"reward_tensor": data.batch["rm_scores"], "reward_extra_info": reward_extra_info}
             else:
-                return data.batch['rm_scores']
+                return data.batch["rm_scores"]
 
         reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
         reward_extra_info = defaultdict(list)
 
         already_print_data_sources = {}
-        to_save_records = []
 
         group_info = self.get_group_info(data)
         for i in range(len(data)):
@@ -200,7 +171,7 @@ class PixelReasonerRewardManager:
                 ground_truth=ground_truth,
                 # extra_info=extra_info,
             ) # 1 or -1
-            score['accuracy'] = 1 if torl_score > 0 else 0
+            score['accuracy'] = 1. if torl_score > 0 else 0.
             score['score'] = torl_score
 
             # add additional penalty
@@ -251,44 +222,6 @@ class PixelReasonerRewardManager:
                         elif isinstance(tool_interact['image'], str):
                             tool_interact['image'] = tool_interact['image'][:50] # for debug
             
-            to_save_prompt = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=False)
-            to_save_resposne = self.tokenizer.decode(response_ids[:valid_response_length], skip_special_tokens=False)
-            to_save_prompt = replace_consecutive_tokens(to_save_prompt, token="<|image_pad|>")
-            to_save_response = replace_consecutive_tokens(to_save_resposne, token="<|image_pad|>")
-            if 'responses_with_loss_mask' in data_item.batch:
-                to_save_response_with_loss_mask = self.tokenizer.decode(valid_response_ids_with_loss_mask, skip_special_tokens=False)
-                to_save_response_with_loss_mask = replace_consecutive_tokens(to_save_response_with_loss_mask, token=self.tokenizer.pad_token)
-            to_save_records.append({
-                'id': data_item.non_tensor_batch['extra_info']['id'] if 'id' in data_item.non_tensor_batch['extra_info'] else None,
-                'data_source': data_source,
-                "prompt": to_save_prompt,
-                "response": to_save_response,
-                'response_with_loss_mask': to_save_response_with_loss_mask if 'responses_with_loss_mask' in data_item.batch else None,
-                'ground_truth': ground_truth,
-                'score': score,
-                'reward': reward,
-                'tool_interact_info': tool_interact_info_i,
-                'extra_info': data_item.non_tensor_batch.get('extra_info', None),
-            })
-            if "turns_stats" in data_item.non_tensor_batch:
-                to_save_records[i]['num_turn'] = data[i].non_tensor_batch["turns_stats"]
-                to_save_records[i]['num_valid_action'] = data[i].non_tensor_batch["valid_action_stats"]
-                to_save_records[i]['is_done'] = not data[i].non_tensor_batch["active_mask"]
-        if save_record:
-            # Save the records to a file
-            if self.num_examine == 1:
-                temp_file = self.record_dir / f"{self.name}-step-val-{self.step}.json"
-            else:
-                temp_file = self.record_dir / f"{self.name}-step-{self.step}.json"
-            self.step += 1
-            if temp_file.exists():
-                with open(temp_file, "r") as f:
-                    existing_records = json.load(f)
-                to_save_records = existing_records + to_save_records
-            with open(temp_file, "w") as f:
-                json.dump(to_save_records, f, indent=4)
-            print(f"Saved records to {temp_file}")
-        
         correct_response_length_mean = np.mean(reward_extra_info['correct_response_length']) if reward_extra_info['correct_response_length'] else 0.0
         wrong_response_length_mean = np.mean(reward_extra_info['wrong_response_length']) if reward_extra_info['wrong_response_length'] else 0.0
         reward_extra_info['correct_response_length'] = [correct_response_length_mean] * len(reward_tensor)
@@ -297,7 +230,7 @@ class PixelReasonerRewardManager:
         if return_dict:
             return {
                 "reward_tensor": reward_tensor,
-                "reward_extra_info": reward_extra_info,
+                "reward_extra_info": dict(sorted(reward_extra_info.items())),
             }
         else:
             return reward_tensor

@@ -10,7 +10,7 @@ import base64
 import io
 from PIL import Image
 from pathlib import Path
-from verl_tool.llm_agent.vision_utils import process_image
+from verl_tool.agent_loop.vision_utils import process_image
 
 def crop(str_image, bbox_2d, padding=(0.1,0.1)):
     """
@@ -301,7 +301,7 @@ class PixelReasonerTool(BaseTool):
         parsed_action, is_valid = self.parse_action(action)
         env = self.load_env(trajectory_id)
         if env['images'] is None:
-            env['images'] = [Path(x) for x in extra_field["images"]]
+            env['images'] = [Path(x) if not x.startswith("data:image") else decode_image_url(x) for x in extra_field.get('images', [])]
         
         if not is_valid:
             observation = ""

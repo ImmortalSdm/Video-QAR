@@ -24,6 +24,55 @@ from verl.workers.reward_manager import register
 import torch
 from collections import defaultdict
 
+def extract_box_contents(text):
+    """
+    Extract contents from \box{} commands in a string.
+    
+    Args:
+        text (str): Input string containing \box{} commands
+        
+    Returns:
+        list: List of contents found inside \box{} commands
+    """
+    # Pattern to match \box{content} with proper brace matching
+    pattern = r'\\boxed\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}'
+    
+    # Find all matches
+    matches = re.findall(pattern, text)
+    return matches[-1] if matches else ""
+
+def extract_answer(text, mode='math'):
+    """
+    Extract the final answer from the text based on the mode.
+    
+    Args:
+        text (str): Input string containing the answer
+        mode (str): Mode of extraction ('math' or 'lcb_code')
+    Returns:
+        str: Extracted answer
+    """
+    if mode == 'math':
+        return extract_box_contents(text)
+    elif mode == 'lcb_code':
+        start_idx = text.rfind('```python')
+        if start_idx != -1:
+            end_idx = text.find('```', start_idx+len('```python'))
+            if end_idx != -1:
+                end_idx += len('```')
+                return text[start_idx:end_idx].strip()
+            else:
+                return text[start_idx:].strip()
+        else:
+            if text.startswith("#"):
+                # this is alread the pure code, but without ```python
+                return "```python\n" + text.strip() + "\n```"
+            else:
+                return ""
+    elif mode == 'hle_judge':
+        return text
+    else:
+        raise ValueError(f"Unsupported mode: {mode}")
+    
 @register("torl")
 class ToRLRewardManager:
     """The reward manager.
@@ -43,9 +92,6 @@ class ToRLRewardManager:
         self.add_unfinished_traj_penalty = False # -0.25 if the traj is not finished
         self.add_no_tool_interact_penalty = False # -0.25 if the traj's num turn is 0, no interaction at all
         self.add_code_exec_penalty = False # -0.25 if the execution has an error.
-        if "record_dir" in kwargs:
-            self.record_dir = Path(kwargs['record_dir'])
-            self.record_dir.mkdir(parents=True, exist_ok=True)
 
     def add_additional_penalties(self, response: str, data_i, scores_i: dict):
         # 1.4 format penalty
@@ -98,46 +144,20 @@ class ToRLRewardManager:
     
     def __call__(self, data: DataProto, return_dict=False):
         """We will expand this function gradually based on the available datasets"""
-        save_record = data.meta_info.get('save_record', True)
-
-        if not hasattr(self, 'record_dir'):
-            if hasattr(self, 'run_id'):
-                self.record_dir = Path(__file__).parent.parent.parent.parent / "verl_step_records" / self.run_id
-                self.record_dir.mkdir(parents=True, exist_ok=True)
-            else:
-                self.record_dir = Path(__file__).parent.parent.parent.parent / "verl_step_records" / f"torl-{time.strftime('%Y-%m-%d-%H-%M-%S')}"
-                self.record_dir.mkdir(parents=True, exist_ok=True)
-        
         # check the last step index
-        if self.step is None:
-            last_step_idx = 0
-            for file in os.listdir(self.record_dir):
-                if self.num_examine == 1:
-                    if re.search(r"step-val-\d+\.json", file):
-                        step_idx = int(file[:-len(".json")].split("-")[-1])
-                        if step_idx > last_step_idx:
-                            last_step_idx = step_idx
-                else:
-                    if re.search(r"step-\d+\.json", file):
-                        step_idx = int(file[:-len(".json")].split("-")[-1])
-                        if step_idx > last_step_idx:
-                            last_step_idx = step_idx
-            self.step = last_step_idx + 1
-        if data.meta_info.get('global_step', None) is not None:
-            self.step = data.meta_info['global_step']
-
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
-        if 'rm_scores' in data.batch.keys():
+        if "rm_scores" in data.batch.keys():
             if return_dict:
-                return {"reward_tensor": data.batch['rm_scores']}
+                reward_extra_keys = data.meta_info.get("reward_extra_keys", [])
+                reward_extra_info = {key: data.non_tensor_batch[key] for key in reward_extra_keys}
+                return {"reward_tensor": data.batch["rm_scores"], "reward_extra_info": reward_extra_info}
             else:
-                return data.batch['rm_scores']
+                return data.batch["rm_scores"]
 
         reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
         reward_extra_info = defaultdict(list)
 
         already_print_data_sources = {}
-        to_save_records = []
 
         for i in range(len(data)):
             score = {}
@@ -153,11 +173,6 @@ class ToRLRewardManager:
             response_ids = data_item.batch['responses']
             valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
             valid_response_ids = response_ids[:valid_response_length]
-            if "loss_mask" in data_item.batch:
-                loss_mask = data_item.batch['loss_mask']
-                valid_response_ids_with_loss_mask = torch.where(loss_mask[prompt_length:prompt_length + valid_response_length] == 1, valid_response_ids, self.tokenizer.pad_token_id)
-            else:
-                valid_response_ids_with_loss_mask = valid_response_ids
 
             # decode
             prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
@@ -168,15 +183,17 @@ class ToRLRewardManager:
             data_source = data_item.non_tensor_batch[self.reward_fn_key]
 
             extra_info = data_item.non_tensor_batch.get('extra_info', None)
-
+            extracted_answer = extract_answer(response_str, mode='math')
+            
             torl_score = self.compute_score(
                 # data_source=data_source,
                 solution_str=response_str,
                 ground_truth=ground_truth,
                 # extra_info=extra_info,
             ) # 1 or -1
-            score['accuracy'] = 1 if torl_score > 0 else 0
+            score['accuracy'] = 1. if torl_score > 0 else 0.
             score['score'] = torl_score
+            score['has_answer'] = 1. if extracted_answer else 0.
 
             # add additional penalty
             score = self.add_additional_penalties(response_str, data_item, score)      
@@ -214,42 +231,7 @@ class ToRLRewardManager:
                         print(f"[{key}]", value)
                 else:
                     print(f"[score]", score)
-                    
-            # Save the records
-            to_save_records.append({
-                'id': data_item.non_tensor_batch['extra_info']['id'] if 'id' in data_item.non_tensor_batch['extra_info'] else None,
-                'data_source': data_source,
-                "prompt": self.tokenizer.decode(prompt_ids[-valid_prompt_length:], skip_special_tokens=False),
-                "response": self.tokenizer.decode(response_ids[:valid_response_length], skip_special_tokens=False),
-                'response_with_loss_mask': self.tokenizer.decode(valid_response_ids_with_loss_mask, skip_special_tokens=False) if 'responses_with_loss_mask' in data_item.batch else None,
-                'ground_truth': ground_truth,
-                'score': score,
-                'reward': reward,
-                'tool_interact_info': data[i].non_tensor_batch.get('tool_interact_info', None),
-                'extra_info': data_item.non_tensor_batch.get('extra_info', None),
-            })
-            if "turns_stats" in data_item.non_tensor_batch:
-                to_save_records[i]['num_turn'] = data[i].non_tensor_batch["turns_stats"]
-                to_save_records[i]['num_valid_action'] = data[i].non_tensor_batch["valid_action_stats"]
-                to_save_records[i]['is_done'] = not data[i].non_tensor_batch["active_mask"]
-        if save_record:
-            # Save the records to a file
-            if self.num_examine == 1:
-                temp_file = self.record_dir / f"{self.name}-step-val-{self.step}.json"
-            else:
-                temp_file = self.record_dir / f"{self.name}-step-{self.step}.json"
-            self.step += 1
-            if temp_file.exists():
-                with open(temp_file, "r") as f:
-                    existing_records = json.load(f)
-                existing_records.extend(to_save_records)
-                with open(temp_file, "w") as f:
-                    json.dump(existing_records, f, indent=4)
-            else:
-                with open(temp_file, "w") as f:
-                    json.dump(to_save_records, f, indent=4)
-            print(f"Saved records to {temp_file}")
-        
+                
         correct_response_length_mean = np.mean(reward_extra_info['correct_response_length']) if reward_extra_info['correct_response_length'] else 0.0
         wrong_response_length_mean = np.mean(reward_extra_info['wrong_response_length']) if reward_extra_info['wrong_response_length'] else 0.0
         reward_extra_info['correct_response_length'] = [correct_response_length_mean] * len(reward_tensor)
@@ -258,7 +240,7 @@ class ToRLRewardManager:
         if return_dict:
             return {
                 "reward_tensor": reward_tensor,
-                "reward_extra_info": reward_extra_info,
+                "reward_extra_info": dict(sorted(reward_extra_info.items()))
             }
         else:
             return reward_tensor

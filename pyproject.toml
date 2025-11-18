@@ -9,9 +9,11 @@ dependencies = [
     "psutils>=3.3.9",
     "timeout-decorator>=0.5.0",
     "pyext",
-    "qwen_vl_utils",
-    "transformers<4.53.0",
+    "qwen_vl_utils>=0.0.14",
+    "qwen_omni_utils",
+    "transformers",
     "tensorboard",
+    "ipython",
     "func_timeout",
     "aiofiles",
 ]
@@ -21,7 +23,7 @@ packages = ["verl_tool"]  # Explicitly specify only the verl_tool package
 
 [project.optional-dependencies]
 vllm = [
-    "vllm<0.9.0",
+    "vllm>=0.11.0",
 ]
 tool_browser = [
     "mini_webarena @ git+https://github.com/cogito233/mini_webarena.git",
@@ -52,4 +54,29 @@ mcp_tool = [
     "datasets",
     "pyarrow",
     "mcp-server-fetch",
+]
+python_code_dep = [
+    "matplotlib",
+    "pycosat",
+    "gmpy2",
+    "cvxpy",
+    "cvxopt",
+    "statsmodels",
+    "datauri",
+    "pytesseract",
+    "igraph",
+    "num2words",
+    "mpmath",
+    "annotated-types>=0.7.0",
+    "h5py",
+    "ipython",
+    "numpy",
+    "pandas",
+    "psutil",
+    "scipy",
+    "sympy",
+    "tqdm",
+    "pulp",
+    "shapely",
+    "ortools",
 ]
