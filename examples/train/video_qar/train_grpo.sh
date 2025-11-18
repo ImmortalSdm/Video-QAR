@@ -1,27 +1,29 @@
 set -ex
 
+export HYDRA_FULL_ERROR=1
 # Dataset paths (update to your local preprocessing outputs)
-dataset_name=video_qar/MultiTurnVideoQAR
-train_data=[$(pwd)/data/${dataset_name}/train.parquet]
-val_data=[$(pwd)/data/${dataset_name}/val.parquet]
+# dataset_name=video_qar/MultiTurnVideoQAR
+train_data=[$(pwd)/data/clevrer_counterfactual_cgbench_sample-5818.parquet]
+val_data=[$(pwd)/data/clevrer_counterfactual_cgbench_sample-1118_turn-3-5.parquet]
+save_path="logs/Qwen2.5-VL-7B_cgbench_sample-2953_max-pixel-196_last-response_max-frame-48_summary_loss_mask-prev-all_turn-2_sft-ep2_turn-5_rl-ep10"
 
 # Base model and training setup
-model_name=Qwen/Qwen2.5-VL-7B-Instruct
+model_name=/home/ma-user/work/dataset/long_video_models/Qwen/Qwen2.5-VL-7B-Instruct
 rl_alg=grpo
 n_gpus_per_node=8
 n_nodes=1
 n=8
 
 # Sequence length limits (ensure they cover your multimodal tokens)
-max_prompt_length=12288
+max_prompt_length=120000
 max_response_length=4096
 max_action_length=2048
 max_obs_length=4096
-max_turns=4
+max_turns=15
 
 # PPO / GRPO hyperparameters
-batch_size=128
-ppo_mini_batch_size=128
+batch_size=16
+ppo_mini_batch_size=2
 ppo_micro_batch_size_per_gpu=1
 log_prob_micro_batch_size_per_gpu=1
 temperature=1.0
@@ -30,6 +32,7 @@ lr=1e-6
 
 # Multi-turn video reasoning specific settings
 action_stop_tokens='</query>'
+action_stop_tokens="</query>,</answer>"
 enable_agent=True
 enable_mtrl=True
 additional_eos_token_ids=[151645] # <|im_end|>
@@ -77,7 +80,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_tool.trainer.main_ppo \
     data.train_files=$train_data \
     data.val_files=$val_data \
     data.train_batch_size=$batch_size \
-    data.val_batch_size=128 \
+    data.val_batch_size=2 \
     data.dataloader_num_workers=4 \
     data.max_prompt_length=$max_prompt_length \
     data.max_response_length=$max_response_length \
@@ -104,7 +107,8 @@ PYTHONUNBUFFERED=1 python3 -m verl_tool.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=$do_offload \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=$fsdp_size \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=$ulysses_sequence_parallel_size \
-    actor_rollout_ref.actor.enable_agent=$enable_agent \
+    actor_rollout_ref.actor.checkpoint.save_contents=['model','optimizer','extra','hf_model'] \
+    actor_rollout_ref.agent.enable_agent=$enable_agent \
     actor_rollout_ref.agent.tool_server_url=$tool_server_url \
     actor_rollout_ref.agent.max_prompt_length=$max_prompt_length \
     actor_rollout_ref.agent.max_response_length=$max_response_length \
